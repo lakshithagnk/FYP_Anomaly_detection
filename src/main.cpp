@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <string.h>
 #include "battery_model.h"
-#include "wifi_server.h"
+#include "wifi_server.h" 
 #include <WiFi.h>
 
 #include <Wire.h>
@@ -15,9 +15,9 @@
 #include "esp_timer.h"
 
 // ================= MODEL / WINDOW CONFIG =================
-#define N_FEATURES 31
 #define WINDOW_SIZE 32
 #define N_CLASSES 4
+#define N_FEATURES 31
 
 #define SAMPLE_TIMEOUT_MS 30000
 
@@ -47,20 +47,19 @@ int   window_head  = 0;     // index of the OLDEST row once the buffer is full
 int   window_count = 0;
 bool  window_ready = false;
 
-unsigned long last_sample_time = 0;   // millis() of last sample RECEIVED over WiFi
+unsigned long last_sample_time = 0;   // millis() of last sample RECEIVED over MQTT
 
 bool fault_flag = false;
 bool buzzer_on = false;
 unsigned long buzzer_last_toggle = 0;
 
-// Display stats — tracked purely for the OLED, not used in any control logic
+// Display stats
 unsigned long fault_count = 0;     // number of distinct fault episodes since boot
 bool prev_fault_state = false;     // used to detect normal->fault edges
 
 // ================= TFLITE =================
 constexpr int TENSOR_ARENA_SIZE = 120 * 1024;
 uint8_t tensor_arena[TENSOR_ARENA_SIZE];
-// uint8_t* tensor_arena = nullptr;
 
 tflite::MicroInterpreter* interpreter;
 TfLiteTensor* input;
@@ -176,7 +175,7 @@ void on_features_received(const float* raw_features, InferenceResult* out) {
 
     out->class_index = pred;
     out->class_name = CLASS_NAMES[pred];
-    out->confidence = conf * 100.0f;   // percentage, matches OLED display
+    out->confidence = conf; // Pass the decimal value (0..1), client parses to %
     out->latency_ms = latency;
     out->fault = fault_flag;
     out->fault_count = fault_count;
@@ -296,7 +295,7 @@ void oled_calibrating(int count, int total) {
     display.display();
 }
 
-// Shown when the watchdog notices the web client has stopped sending data.
+// Shown when client has stopped sending MQTT data.
 void oled_waiting_for_data(unsigned long since_last_ms) {
     display.clearDisplay();
     oled_draw_header();
@@ -304,7 +303,7 @@ void oled_waiting_for_data(unsigned long since_last_ms) {
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
     display.setCursor(0, 20);
-    display.print("Waiting for data...");
+    display.print("Waiting for MQTT...");
 
     display.setCursor(0, 34);
     display.print("Last sample: ");
@@ -312,7 +311,7 @@ void oled_waiting_for_data(unsigned long since_last_ms) {
     display.print("s ago");
 
     display.setCursor(0, 48);
-    display.print("AP clients ok, no POST");
+    display.print(mqtt_client_is_connected() ? "Broker: Connected" : "Broker: Offline");
 
     display.display();
 }
@@ -350,18 +349,25 @@ void setup() {
     input = interpreter->input(0);
     output = interpreter->output(0);
 
-    wifi_server_set_inference_callback(on_features_received);
-    wifi_server_begin();
+    // Setup WiFi Station and MQTT secure client loop
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 16);
+    display.println("Connecting WiFi...");
+    display.display();
+
+    mqtt_client_begin(on_features_received);
 
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(0, 12);
-    display.println("System Ready");
+    display.println("System Ready ✅");
     display.setCursor(0, 26);
-    display.println("AP: BatteryMonitor_AP");
+    display.print("SSID: ");
+    display.println(WiFi.SSID());
     display.setCursor(0, 40);
     display.print("IP: ");
-    display.println(WiFi.softAPIP());
+    display.println(WiFi.localIP());
     display.display();
 
     last_sample_time = millis();
@@ -369,19 +375,14 @@ void setup() {
 
 // ================= LOOP =================
 void loop() {
+    // Keep connection alive, listen for messages
+    mqtt_client_handle();
 
-    wifi_server_handle();
-
-    if (wifi_server_result_available()) {
- 
-    } else {
-
-        unsigned long since_last = millis() - last_sample_time;
-        if (since_last > SAMPLE_TIMEOUT_MS) {
-            oled_waiting_for_data(since_last);
-        }
+    // Check watchdog timer for incoming messages
+    unsigned long since_last = millis() - last_sample_time;
+    if (since_last > SAMPLE_TIMEOUT_MS) {
+        oled_waiting_for_data(since_last);
     }
 
     updateBuzzer(fault_flag);
 }
-

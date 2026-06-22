@@ -1,203 +1,162 @@
 #include "wifi_server.h"
-
 #include <WiFi.h>
-#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-// ================= INTERNAL STATE =================
-static WebServer server(WIFI_HTTP_PORT);
+static WiFiClientSecure secureClient;
+static WiFiClient regularClient;
+static PubSubClient mqttClient;
 
 static InferenceCallback inference_cb = nullptr;
+static unsigned long last_reconnect_attempt = 0;
 
-static InferenceResult latest_result;
-static volatile bool result_available_flag = false;
+// ================= INCOMING MESSAGE HANDLER =================
+static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message arrived on [");
+    Serial.print(topic);
+    Serial.println("]");
 
-static unsigned long total_samples = 0;
-static unsigned long total_errors  = 0;
-
-
-static StaticJsonDocument<1024> json_doc;
-
-// ================= HELPERS =================
-
-static String build_result_json(const InferenceResult& r, const char* error) {
-    StaticJsonDocument<512> doc;
-
-    if (error != nullptr) {
-        doc["status"] = "error";
-        doc["error"] = error;
-        doc["prediction"] = nullptr;
-        doc["confidence"] = nullptr;
-        doc["latency_ms"] = nullptr;
-        doc["fault"] = false;
-        doc["fault_count"] = 0;
-        doc["window_ready"] = false;
-    } else {
-        doc["status"] = "ok";
-        doc["window_ready"] = r.window_ready;
-        doc["fault_count"] = r.fault_count;
-
-        if (r.window_ready && r.ok) {
-            doc["prediction"] = r.class_name;
-            doc["confidence"] = serialized(String(r.confidence, 1));
-            doc["latency_ms"] = serialized(String(r.latency_ms, 2));
-            doc["fault"] = r.fault;
-        } else {
-           
-            doc["prediction"] = nullptr;
-            doc["confidence"] = nullptr;
-            doc["latency_ms"] = nullptr;
-            doc["fault"] = false;
-        }
-    }
-
-    String out;
-    serializeJson(doc, out);
-    return out;
-}
-
-// ================= HANDLERS =================
-
-// Handler for OPTIONS preflight request
-static void handle_options_data() {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.sendHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-    server.send(204); // 204 No Content
-}
-
-// POST /data
-// Body: {"features":[f0, f1, ..., f30]}
-static void handle_post_data() {
-
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.sendHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-    if (!server.hasArg("plain")) {
-        total_errors++;
-        server.send(400, "application/json",
-                     build_result_json(InferenceResult{}, "missing body"));
+    // Parse incoming JSON payload: {"features": [f0, f1, ..., f30]}
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+    if (error) {
+        Serial.print("JSON deserialization failed: ");
+        Serial.println(error.c_str());
         return;
     }
 
-    if (!server.hasArg("plain")) {
-        total_errors++;
-        server.send(400, "application/json",
-                     build_result_json(InferenceResult{}, "missing body"));
+    JsonArray arr = doc["features"].as<JsonArray>();
+    if (arr.isNull() || arr.size() != N_FEATURES) {
+        Serial.println("Invalid features array in payload");
         return;
     }
 
-    const String& body = server.arg("plain");
-
-    json_doc.clear();
-    DeserializationError err = deserializeJson(json_doc, body);
-    if (err) {
-        total_errors++;
-        server.send(400, "application/json",
-                     build_result_json(InferenceResult{}, "invalid json"));
-        return;
+    float parsed_features[N_FEATURES];
+    for (size_t i = 0; i < N_FEATURES; i++) {
+        parsed_features[i] = arr[i].as<float>();
     }
 
-    JsonArray arr = json_doc["features"].as<JsonArray>();
-    if (arr.isNull() || arr.size() != WIFI_N_FEATURES) {
-        total_errors++;
-        server.send(400, "application/json",
-                     build_result_json(InferenceResult{},
-                         "features must be an array of 31 numbers"));
-        return;
-    }
-
-    float parsed[WIFI_N_FEATURES];
-    size_t i = 0;
-    for (JsonVariant v : arr) {
-        if (!v.is<float>() && !v.is<int>()) {
-            total_errors++;
-            server.send(400, "application/json",
-                         build_result_json(InferenceResult{},
-                             "non-numeric feature value"));
-            return;
-        }
-        parsed[i++] = v.as<float>();
-    }
-
-    total_samples++;
-
-    if (inference_cb == nullptr) {
-        // No callback registered — should not happen in normal operation,
-        // but fail loudly rather than silently dropping the sample.
-        total_errors++;
-        server.send(500, "application/json",
-                     build_result_json(InferenceResult{},
-                         "inference callback not registered"));
-        return;
-    }
-
+    // Call TF Lite inference engine callback in main.cpp
     InferenceResult result = {};
     result.class_index = -1;
     result.class_name = nullptr;
-    inference_cb(parsed, &result);
+    
+    if (inference_cb != nullptr) {
+        inference_cb(parsed_features, &result);
+    }
 
-    // Stash a copy so main.cpp's loop() can refresh the OLED/buzzer state
-    latest_result = result;
-    result_available_flag = true;
+    // Publish the classification results: {"status":"ok", "window_ready": true, ...}
+    StaticJsonDocument<512> responseDoc;
+    responseDoc["status"] = result.ok ? "ok" : "error";
+    responseDoc["window_ready"] = result.window_ready;
+    responseDoc["fault_count"] = result.fault_count;
 
-    int http_status = result.ok ? 200 : 500;
-    server.send(http_status, "application/json",
-                 build_result_json(result, result.ok ? nullptr : "inference failed"));
+    if (result.window_ready && result.ok) {
+        responseDoc["prediction"] = result.class_name;
+        responseDoc["confidence"] = serialized(String(result.confidence, 1));
+        responseDoc["latency_ms"] = serialized(String(result.latency_ms, 2));
+        responseDoc["fault"] = result.fault;
+    } else {
+        responseDoc["prediction"] = nullptr;
+        responseDoc["confidence"] = nullptr;
+        responseDoc["latency_ms"] = nullptr;
+        responseDoc["fault"] = false;
+    }
+
+    String responseString;
+    serializeJson(responseDoc, responseString);
+    
+    mqttClient.publish(TOPIC_PREDICTION, responseString.c_str());
+    Serial.print("Published prediction: ");
+    Serial.println(responseString);
 }
 
-static void handle_not_found() {
-    total_errors++;
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(404, "application/json",
-                 build_result_json(InferenceResult{}, "not found"));
+// ================= RECONNECTION MANAGEMENT =================
+static bool connect_mqtt() {
+    String clientId = "ESP32-BMS-" + String(random(0xffff), HEX);
+    Serial.print("Attempting MQTT connection to ");
+    Serial.print(MQTT_BROKER);
+    Serial.print("...");
+    
+    bool connected = false;
+    if (String(MQTT_USER).length() > 0) {
+        connected = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS);
+    } else {
+        connected = mqttClient.connect(clientId.c_str());
+    }
+
+    if (connected) {
+        Serial.println("connected ✅");
+        mqttClient.subscribe(TOPIC_FEATURES);
+        Serial.print("Subscribed to: ");
+        Serial.println(TOPIC_FEATURES);
+        return true;
+    } else {
+        Serial.print("failed, rc=");
+        Serial.print(mqttClient.state());
+        Serial.println(" ❌ (Retrying in 5 seconds)");
+        return false;
+    }
 }
 
 // ================= PUBLIC API =================
 
-void wifi_server_set_inference_callback(InferenceCallback cb) {
+void mqtt_client_begin(InferenceCallback cb) {
     inference_cb = cb;
-}
 
-void wifi_server_begin() {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL,
-                WIFI_AP_HIDDEN, WIFI_AP_MAX_CONN);
+    // Connect to WiFi Station
+    Serial.println();
+    Serial.print("Connecting to WiFi network: ");
+    Serial.println(WIFI_SSID);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    Serial.print("AP started. SSID: ");
-    Serial.print(WIFI_AP_SSID);
-    Serial.print("  IP: ");
-    Serial.println(WiFi.softAPIP());
-
-    server.on(WIFI_DATA_PATH, HTTP_POST, handle_post_data);
-    server.on(WIFI_DATA_PATH, HTTP_OPTIONS, handle_options_data); // <-- ADD THIS LINE
-    server.onNotFound(handle_not_found);
-    server.begin();
-
-    Serial.print("HTTP server listening on port ");
-    Serial.println(WIFI_HTTP_PORT);
-}
-
-void wifi_server_handle() {
-    server.handleClient();
-}
-
-unsigned long wifi_server_total_samples() {
-    return total_samples;
-}
-
-unsigned long wifi_server_total_errors() {
-    return total_errors;
-}
-
-bool wifi_server_result_available() {
-    if (result_available_flag) {
-        result_available_flag = false;
-        return true;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
     }
-    return false;
+    Serial.println("connected! ✅");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Configure SSL/TLS Security or Standard socket depending on the port
+    if (MQTT_PORT == 8883) {
+        // Skips CA certificate validation to make HiveMQ/EMQX cloud setup easy
+        secureClient.setInsecure(); 
+        mqttClient.setClient(secureClient);
+    } else {
+        mqttClient.setClient(regularClient);
+    }
+
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setCallback(mqtt_callback);
+    
+    // Increase buffer size to handle the large 31-feature input string
+    mqttClient.setBufferSize(2048); 
 }
 
-void wifi_server_get_latest_result(InferenceResult* out) {
-    *out = latest_result;
+void mqtt_client_handle() {
+    // If WiFi drops, block loop actions until reconnect
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    // Non-blocking MQTT reconnect handler
+    if (!mqttClient.connected()) {
+        unsigned long now = millis();
+        if (now - last_reconnect_attempt > 5000) {
+            last_reconnect_attempt = now;
+            if (connect_mqtt()) {
+                last_reconnect_attempt = 0;
+            }
+        }
+    } else {
+        mqttClient.loop();
+    }
+}
+
+bool mqtt_client_is_connected() {
+    return mqttClient.connected();
 }
