@@ -20,8 +20,8 @@ struct InferenceResult {
 typedef void (*InferenceCallback)(const float* raw_features, InferenceResult* out);
 
 // ================= WIFI & MQTT CONFIGURATION =================
-#define WIFI_SSID     "nuwan"
-#define WIFI_PASSWORD "1968nuwan"
+#define WIFI_SSID     "Galaxy A12 E95A"
+#define WIFI_PASSWORD "fnpv7576"
 
 // Cloud MQTT Broker (e.g. HiveMQ Cloud, EMQX Cloud, or public testing brokers)
 #define MQTT_BROKER   "85d119b1fc5546828fe0484af72962c3.s1.eu.hivemq.cloud" 
