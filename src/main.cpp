@@ -66,6 +66,19 @@ TfLiteTensor* input;
 TfLiteTensor* output;
 tflite::AllOpsResolver resolver;
 
+void print_ram_usage(const char* stage) {
+    const unsigned long heap_total = ESP.getHeapSize();
+    const unsigned long heap_free = ESP.getFreeHeap();
+    const unsigned long heap_used = heap_total - heap_free;
+
+    Serial.printf("[RAM] %s\n", stage);
+    Serial.printf("  Tensor Arena: %lu bytes\n", (unsigned long)TENSOR_ARENA_SIZE);
+    Serial.printf("  Heap Used   : %lu bytes\n", heap_used);
+    Serial.printf("  Heap Free   : %lu bytes\n", heap_free);
+    Serial.printf("  Heap MinFree: %lu bytes\n", (unsigned long)ESP.getMinFreeHeap());
+    Serial.printf("  Total RAM Footprint (Arena + Heap Used): %lu bytes\n", (unsigned long)TENSOR_ARENA_SIZE + heap_used);
+}
+
 // ================= NORMALIZATION =================
 
 float feature_mean[N_FEATURES] = {
@@ -319,6 +332,9 @@ void oled_waiting_for_data(unsigned long since_last_ms) {
 // ================= SETUP =================
 void setup() {
     Serial.begin(115200);
+    delay(200);
+
+    print_ram_usage("Boot");
 
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
@@ -345,6 +361,8 @@ void setup() {
         display.display();
         while (true) delay(1000);
     }
+
+    print_ram_usage("After AllocateTensors");
 
     input = interpreter->input(0);
     output = interpreter->output(0);
